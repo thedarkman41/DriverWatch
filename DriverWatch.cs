@@ -1,20 +1,23 @@
-// DriverWatch — a system-tray app that lists this machine's drivers with their
-// version and release date, checks weekly whether each is current (against
-// Windows Update and, for known components, the vendor), and offers a one-click
-// update on the ones that are behind.
+// DriverWatch — a system-tray app that lists this machine's AMD and Realtek
+// drivers with their version and release date, checks weekly whether each is
+// current (against Windows Update and, for the AMD GPU, the vendor), and offers
+// a one-click update on the ones that are behind.
 //
-// Beacon-family app: it serves the Beacon web look (dark ground, gold accent,
-// row-per-item) on a loopback port and lives in the tray with no taskbar entry.
+// Beacon-family app. The window is a native, frameless, always-on-top panel in
+// the upper-right — the same look as Beacon Prime's Gio panel (dark 0x202226
+// ground, gold 0xf4c95d accent, one row per item) — owner-drawn with GDI+, NOT
+// a web page. It lives in the tray with no taskbar entry: left-click the tray
+// icon to toggle the panel, right-click for the menu.
+//
 // Windows-only, compiled on the box by the .NET Framework csc (C# 5), same as
-// the Bezel agent. Build/deploy/register live in Scripts/.
-//
-// Target: /target:winexe so there is no console window. Runs in the interactive
-// session (the tray needs a desktop), started by a per-user logon task.
+// the Bezel agent. Build/deploy/register live in Scripts/. Target /target:winexe
+// so there is no console window; runs in the interactive logon session.
 
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Globalization;
 using System.IO;
 using System.Management;
@@ -33,22 +36,31 @@ namespace DriverWatch
         public string Id;             // stable across runs, for the update call
         public string Name;
         public string Version;
-        public string Date;           // yyyy-MM-dd, or "" when Windows does not record one
+        public string Date;           // yyyy-MM-dd, or "" when Windows records none
         public string Vendor;
-        public string Class;          // DISPLAY, NET, MEDIA, SYSTEM, ...
+        public string Class;          // DISPLAY, NET, MEDIA, BLUETOOTH, ...
         public List<string> HardwareIds = new List<string>();
 
         public bool UpdateAvailable;
-        public string UpdateSource;   // "Windows Update", "AMD", "Realtek", ...
+        public string UpdateSource;   // "Windows Update", "AMD", ...
         public string UpdateVersion;  // the newer version, when known
         public string UpdateRef;      // a Windows Update UpdateID, or a vendor URL
-        public bool CanInstall;       // true = we can install it here; false = opens the vendor page
+        public bool CanInstall;       // true = install here; false = opens vendor page
+    }
+
+    // An immutable read of state, handed to the panel to paint.
+    class Snapshot
+    {
+        public List<DriverEntry> Rows;
+        public bool Checking;
+        public DateTime LastCheck;
+        public string Error;
     }
 
     static class Program
     {
-        const int Port = 48620;
         static NotifyIcon _tray;
+        static PanelForm _panel;
         static readonly object _gate = new object();
         static List<DriverEntry> _entries = new List<DriverEntry>();
         static DateTime _lastCheck = DateTime.MinValue;
@@ -69,12 +81,20 @@ namespace DriverWatch
             try { Directory.CreateDirectory(DataDir()); }
             catch { }
 
-            // A headless mode the weekly logon task can call to refresh in the
-            // background without a tray, if we ever want it separate. For now the
+            // Headless refresh hook (e.g. for a separate scheduled task). The
             // running app schedules its own weekly check, so this is a manual hook.
-            if (args.Length > 0 && args[0] == "--check")
+            if (args.Length > 0 && args[0] == "--check") { RunCheck(); return; }
+
+            // Headless render hook: paint the panel (after a real check) to a PNG
+            // and exit. Used to preview the native window without a live desktop.
+            if (args.Length > 1 && args[0] == "--render")
             {
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                PanelForm pf = new PanelForm();
+                IntPtr hp = pf.Handle;
                 RunCheck();
+                pf.RenderTo(args[1]);
                 return;
             }
 
@@ -82,8 +102,13 @@ namespace DriverWatch
             Application.SetCompatibleTextRenderingDefault(false);
 
             SetupTray();
-            StartServer();
+            _panel = new PanelForm();
+            // Create the handle now (without showing) so background checks can
+            // BeginInvoke a repaint before the panel is first opened.
+            IntPtr forceHandle = _panel.Handle;
+
             StartScheduler();
+            ThreadPool.QueueUserWorkItem(delegate { RunCheck(); });   // first check
 
             Application.Run();
 
@@ -111,9 +136,9 @@ namespace DriverWatch
 
             ContextMenuStrip menu = new ContextMenuStrip();
             ToolStripMenuItem open = new ToolStripMenuItem("Open DriverWatch");
-            open.Click += delegate { OpenDashboard(); };
+            open.Click += delegate { ShowPanel(); };
             ToolStripMenuItem check = new ToolStripMenuItem("Check now");
-            check.Click += delegate { ThreadPool.QueueUserWorkItem(delegate { RunCheck(); }); };
+            check.Click += delegate { RequestCheck(); };
             ToolStripMenuItem quit = new ToolStripMenuItem("Quit");
             quit.Click += delegate { Application.Exit(); };
             menu.Items.Add(open);
@@ -121,13 +146,24 @@ namespace DriverWatch
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(quit);
             _tray.ContextMenuStrip = menu;
-            _tray.DoubleClick += delegate { OpenDashboard(); };
+
+            // Left-click toggles the panel; right-click shows the menu (built in).
+            _tray.MouseClick += delegate(object s, MouseEventArgs e)
+            {
+                if (e.Button == MouseButtons.Left) TogglePanel();
+            };
         }
 
-        static void OpenDashboard()
+        internal static void ShowPanel() { if (_panel != null) _panel.ShowPanel(); }
+
+        internal static void TogglePanel()
         {
-            try { Process.Start("http://127.0.0.1:" + Port + "/"); }
-            catch (Exception e) { Log("open dashboard failed: " + e.Message); }
+            if (_panel == null) return;
+            // If the panel was hidden a moment ago by losing focus, this same tray
+            // click is the dismiss — don't immediately reopen it.
+            if ((DateTime.UtcNow - _panel.LastHidden).TotalMilliseconds < 300) return;
+            if (_panel.Visible) _panel.HidePanel();
+            else _panel.ShowPanel();
         }
 
         // A drawn icon so there is no .ico to ship: a gold dot for the Beacon
@@ -138,7 +174,7 @@ namespace DriverWatch
             Bitmap bmp = new Bitmap(32, 32);
             using (Graphics g = Graphics.FromImage(bmp))
             {
-                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                g.SmoothingMode = SmoothingMode.AntiAlias;
                 g.Clear(Color.Transparent);
                 if (attention)
                 {
@@ -175,14 +211,20 @@ namespace DriverWatch
             _timer = new System.Threading.Timer(delegate
             {
                 if (DateTime.UtcNow - _lastCheck >= TimeSpan.FromDays(7)) RunCheck();
-            }, null, TimeSpan.FromSeconds(20), TimeSpan.FromHours(6));
+            }, null, TimeSpan.FromHours(6), TimeSpan.FromHours(6));
         }
 
         // ---- The check ------------------------------------------------------
 
+        internal static void RequestCheck()
+        {
+            ThreadPool.QueueUserWorkItem(delegate { RunCheck(); });
+        }
+
         static void RunCheck()
         {
             lock (_gate) { if (_checking) return; _checking = true; _checkError = ""; }
+            if (_panel != null) _panel.PushSnapshot();   // show "Checking…"
             try
             {
                 Log("check: starting");
@@ -202,22 +244,46 @@ namespace DriverWatch
                 }
                 RefreshTrayIcon();
                 int n = 0; foreach (DriverEntry e in list) if (e.UpdateAvailable) n++;
-                Log("check: done — " + list.Count + " drivers, " + n + " with updates");
+                Log("check: done - " + list.Count + " drivers, " + n + " with updates");
             }
             catch (Exception e)
             {
                 Log("check failed: " + e.Message);
                 _checkError = e.Message;
             }
-            finally { lock (_gate) { _checking = false; } }
+            finally
+            {
+                lock (_gate) { _checking = false; }
+                if (_panel != null) _panel.PushSnapshot();
+            }
         }
 
-        // Only the classes worth showing — the ones with real hardware behind them
-        // that actually get vendor drivers. Skipping the software/enumerator noise
-        // keeps the list about drivers, not the hundred inbox shims.
-        static readonly HashSet<string> Interesting = new HashSet<string>(
-            new string[] { "DISPLAY", "NET", "MEDIA", "SYSTEM", "HDC", "USB", "BLUETOOTH", "MONITOR", "PRINTER", "IMAGE", "SCSIADAPTER", "KEYBOARD", "MOUSE", "FIRMWARE" },
-            StringComparer.OrdinalIgnoreCase);
+        internal static Snapshot Gather()
+        {
+            Snapshot s = new Snapshot();
+            lock (_gate)
+            {
+                s.Rows = new List<DriverEntry>(_entries);
+                s.Checking = _checking;
+                s.LastCheck = _lastCheck;
+                s.Error = _checkError;
+            }
+            return s;
+        }
+
+        // Track only what was asked for: the AMD Radeon graphics driver, the AMD
+        // High Definition Audio device, and any Realtek driver. Everything else
+        // (Microsoft inbox drivers, the monitor, enumerators) is left out.
+        static bool Keep(string name, string vendor, string cls)
+        {
+            string n = name == null ? "" : name;
+            string v = vendor == null ? "" : vendor;
+            if (Has(n, "Radeon")) return true;                       // AMD GPU
+            if (Has(n, "AMD High Definition Audio")) return true;    // AMD HD audio device
+            if (Has(n, "Realtek") || Has(v, "Realtek")) return true; // any Realtek
+            return false;
+        }
+        static bool Has(string s, string sub) { return s.IndexOf(sub, StringComparison.OrdinalIgnoreCase) >= 0; }
 
         static List<DriverEntry> Enumerate()
         {
@@ -232,18 +298,17 @@ namespace DriverWatch
                     string name = AsString(mo["DeviceName"]);
                     string ver = AsString(mo["DriverVersion"]);
                     string cls = AsString(mo["DeviceClass"]);
-                    if (name.Length == 0 || ver.Length == 0) continue;
-                    if (!Interesting.Contains(cls)) continue;
-
                     string vendor = AsString(mo["DriverProviderName"]);
+                    if (name.Length == 0 || ver.Length == 0) continue;
+                    if (!Keep(name, vendor, cls)) continue;
+
                     string date = ParseDriverDate(AsString(mo["DriverDate"]));
                     string key = cls + "|" + name + "|" + vendor;
 
                     DriverEntry existing;
                     if (byKey.TryGetValue(key, out existing))
                     {
-                        // Same device enumerated more than once (per-monitor, per-port):
-                        // keep the newest driver version we see for it.
+                        // Same device enumerated more than once: keep the newest version.
                         if (CompareVersions(ver, existing.Version) > 0) { existing.Version = ver; existing.Date = date; }
                         continue;
                     }
@@ -261,12 +326,22 @@ namespace DriverWatch
 
             list.Sort(delegate(DriverEntry a, DriverEntry b)
             {
-                int c = string.Compare(a.Class, b.Class, StringComparison.OrdinalIgnoreCase);
+                int c = ClassRank(a.Class) - ClassRank(b.Class);
                 if (c != 0) return c;
                 return string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
             });
             return list;
         }
+
+        static int ClassRank(string cls)
+        {
+            if (Eq(cls, "DISPLAY")) return 0;
+            if (Eq(cls, "MEDIA")) return 1;
+            if (Eq(cls, "NET")) return 2;
+            if (Eq(cls, "BLUETOOTH")) return 3;
+            return 4;
+        }
+        static bool Eq(string a, string b) { return string.Equals(a, b, StringComparison.OrdinalIgnoreCase); }
 
         // ---- Windows Update -------------------------------------------------
 
@@ -287,31 +362,18 @@ namespace DriverWatch
                 string id = "";
                 try { id = (string)u.Identity.UpdateID; } catch { }
                 if (id.Length == 0) continue;
-                store[id] = u;
 
+                // Only surface Windows Update drivers that map to a tracked device;
+                // ignore the rest (we deliberately do not show the whole WU list).
                 DriverEntry match = MatchByTitle(drivers, title);
                 if (match != null)
                 {
+                    store[id] = u;
                     match.UpdateAvailable = true;
                     match.UpdateSource = "Windows Update";
                     match.UpdateVersion = "";
                     match.UpdateRef = id;
                     match.CanInstall = true;
-                }
-                else
-                {
-                    DriverEntry e = new DriverEntry();
-                    e.Id = "wu-" + id;
-                    e.Name = title;
-                    e.Version = "";
-                    e.Date = "";
-                    e.Vendor = "Windows Update";
-                    e.Class = "UPDATE";
-                    e.UpdateAvailable = true;
-                    e.UpdateSource = "Windows Update";
-                    e.UpdateRef = id;
-                    e.CanInstall = true;
-                    drivers.Add(e);
                 }
             }
         }
@@ -335,30 +397,28 @@ namespace DriverWatch
         //
         // Best-effort, per known component. Windows Update is conservative and
         // will not always surface a vendor's newest optional driver, so for the
-        // parts we recognise we compare against the vendor directly. Each checker
-        // is deliberately small and defensive: a vendor page that has moved or
-        // changed shape returns "unknown", never a wrong answer.
+        // AMD GPU we compare against AMD directly. The checker is small and
+        // defensive: a vendor page that has moved returns "unknown", never a wrong
+        // answer. Realtek and the AMD audio device rely on Windows Update.
 
         static void CheckVendors(List<DriverEntry> drivers)
         {
             foreach (DriverEntry d in drivers)
             {
                 if (d.UpdateAvailable) continue;   // Windows Update already spoke
-                VendorResult r = null;
 
-                bool amd = d.Vendor.IndexOf("Advanced Micro Devices", StringComparison.OrdinalIgnoreCase) >= 0
-                        || d.Vendor.Equals("AMD", StringComparison.OrdinalIgnoreCase);
-
-                if (amd && d.Class.Equals("DISPLAY", StringComparison.OrdinalIgnoreCase))
-                    r = CheckAmdGraphics(d.Version);
-
-                if (r != null && r.Available)
+                bool amd = Has(d.Vendor, "Advanced Micro Devices") || Eq(d.Vendor, "AMD");
+                if (amd && Eq(d.Class, "DISPLAY"))
                 {
-                    d.UpdateAvailable = true;
-                    d.UpdateSource = r.Source;
-                    d.UpdateVersion = r.Version;
-                    d.UpdateRef = r.Url;
-                    d.CanInstall = false;   // vendor packages install themselves; we open the page
+                    VendorResult r = CheckAmdGraphics(d.Version);
+                    if (r != null && r.Available)
+                    {
+                        d.UpdateAvailable = true;
+                        d.UpdateSource = r.Source;
+                        d.UpdateVersion = r.Version;
+                        d.UpdateRef = r.Url;
+                        d.CanInstall = false;   // vendor package: open the page, don't run a .exe blind
+                    }
                 }
             }
         }
@@ -389,7 +449,7 @@ namespace DriverWatch
                 string notesUrl = ProbeLatestAmdNotes();
                 if (notesUrl == null) return r;
                 string notes = Fetch(notesUrl);
-                Match store = Regex.Match(notes ?? "", @"Windows Driver Store Version\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)",
+                Match store = Regex.Match(notes == null ? "" : notes, @"Windows Driver Store Version\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)",
                     RegexOptions.IgnoreCase);
                 if (!store.Success) return r;
                 string latest = store.Groups[1].Value;
@@ -414,7 +474,6 @@ namespace DriverWatch
             int yy = now.Year % 100, mo = now.Month;
             for (int back = 0; back < 18; back++)
             {
-                // Revisions within a month, newest first, plus the bare "YY-M" form.
                 for (int p = 4; p >= 1; p--)
                 {
                     string u = AmdNotesBase + yy + "-" + mo + "-" + p + "-POLARIS-VEGA.html";
@@ -447,8 +506,6 @@ namespace DriverWatch
         {
             try
             {
-                // .NET Framework defaults to SSL3/TLS1.0, which modern vendor
-                // sites reject at the handshake. Opt into TLS 1.2 (present on 4.8).
                 try { ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | SecurityProtocolType.Tls11 | SecurityProtocolType.Tls; } catch { }
                 HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
                 req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) DriverWatch/1.0";
@@ -463,7 +520,7 @@ namespace DriverWatch
 
         // ---- Install --------------------------------------------------------
 
-        static string InstallUpdate(string entryId)
+        internal static string Install(string entryId)
         {
             DriverEntry target = null;
             object wu = null;
@@ -473,7 +530,7 @@ namespace DriverWatch
                 if (target != null && target.CanInstall && target.UpdateRef != null)
                     _wuUpdates.TryGetValue(target.UpdateRef, out wu);
             }
-            if (target == null) return "That driver is no longer in the list; run a check and try again.";
+            if (target == null) return "That driver is no longer listed; check again.";
             if (!target.UpdateAvailable) return "No update is pending for that driver.";
 
             if (!target.CanInstall)
@@ -484,7 +541,7 @@ namespace DriverWatch
                 catch (Exception e) { return "Could not open the vendor page: " + e.Message; }
             }
 
-            if (wu == null) return "The Windows Update entry expired; run a check and try again.";
+            if (wu == null) return "The Windows Update entry expired; check again.";
             try
             {
                 Type t = Type.GetTypeFromProgID("Microsoft.Update.UpdateColl");
@@ -503,103 +560,14 @@ namespace DriverWatch
                 dynamic ir = installer.Install();
                 int code = (int)ir.ResultCode;   // 2 == Succeeded
                 bool reboot = false; try { reboot = (bool)ir.RebootRequired; } catch { }
-                if (code == 2) { ThreadPool.QueueUserWorkItem(delegate { RunCheck(); }); return "Installed. " + (reboot ? "A restart is needed to finish." : ""); }
-                return "Windows Update returned result code " + code + " (needs elevation, or the update was superseded).";
+                if (code == 2) { ThreadPool.QueueUserWorkItem(delegate { RunCheck(); }); return "Installed. " + (reboot ? "Restart to finish." : ""); }
+                return "Windows Update returned code " + code + " (needs elevation, or superseded).";
             }
             catch (Exception e)
             {
                 Log("install failed: " + e.Message);
-                return "Install failed: " + e.Message + " (DriverWatch must run elevated to install drivers).";
+                return "Install failed: " + e.Message;
             }
-        }
-
-        // ---- HTTP server ----------------------------------------------------
-
-        static void StartServer()
-        {
-            Thread th = new Thread(ServerLoop);
-            th.IsBackground = true;
-            th.Start();
-            // Kick off the first check now that the server can show progress.
-            ThreadPool.QueueUserWorkItem(delegate { RunCheck(); });
-        }
-
-        static void ServerLoop()
-        {
-            HttpListener listener = new HttpListener();
-            listener.Prefixes.Add("http://127.0.0.1:" + Port + "/");
-            try { listener.Start(); }
-            catch (Exception e) { Log("HTTP listen failed: " + e.Message); return; }
-            Log("serving on http://127.0.0.1:" + Port + "/");
-            while (true)
-            {
-                HttpListenerContext ctx;
-                try { ctx = listener.GetContext(); }
-                catch { break; }
-                try { Handle(ctx); }
-                catch (Exception e) { Log("request: " + e.Message); }
-                finally { try { ctx.Response.Close(); } catch { } }
-            }
-        }
-
-        static void Handle(HttpListenerContext ctx)
-        {
-            string path = ctx.Request.Url.AbsolutePath;
-            string method = ctx.Request.HttpMethod;
-
-            if (method == "GET" && path == "/") { Write(ctx, "text/html; charset=utf-8", Html); return; }
-            if (method == "GET" && path == "/api/drivers") { Write(ctx, "application/json", DriversJson()); return; }
-            if (method == "POST" && path == "/api/check") { ThreadPool.QueueUserWorkItem(delegate { RunCheck(); }); Write(ctx, "application/json", "{\"ok\":true}"); return; }
-            if (method == "POST" && path == "/api/update")
-            {
-                string body;
-                using (StreamReader sr = new StreamReader(ctx.Request.InputStream)) body = sr.ReadToEnd();
-                string id = JsonField(body, "id");
-                string msg = InstallUpdate(id);
-                Write(ctx, "application/json", "{\"ok\":true,\"message\":" + JsonStr(msg) + "}");
-                return;
-            }
-            ctx.Response.StatusCode = 404;
-            Write(ctx, "text/plain", "not found");
-        }
-
-        static void Write(HttpListenerContext ctx, string contentType, string body)
-        {
-            byte[] bytes = Encoding.UTF8.GetBytes(body);
-            ctx.Response.ContentType = contentType;
-            ctx.Response.ContentLength64 = bytes.Length;
-            ctx.Response.OutputStream.Write(bytes, 0, bytes.Length);
-        }
-
-        static string DriversJson()
-        {
-            StringBuilder sb = new StringBuilder();
-            lock (_gate)
-            {
-                sb.Append("{\"host\":").Append(JsonStr(Environment.MachineName.ToLowerInvariant()));
-                sb.Append(",\"checking\":").Append(_checking ? "true" : "false");
-                sb.Append(",\"lastCheck\":").Append(JsonStr(_lastCheck == DateTime.MinValue ? "" : _lastCheck.ToLocalTime().ToString("yyyy-MM-dd HH:mm")));
-                sb.Append(",\"error\":").Append(JsonStr(_checkError));
-                sb.Append(",\"drivers\":[");
-                for (int i = 0; i < _entries.Count; i++)
-                {
-                    DriverEntry e = _entries[i];
-                    if (i > 0) sb.Append(',');
-                    sb.Append("{\"id\":").Append(JsonStr(e.Id));
-                    sb.Append(",\"name\":").Append(JsonStr(e.Name));
-                    sb.Append(",\"version\":").Append(JsonStr(e.Version));
-                    sb.Append(",\"date\":").Append(JsonStr(e.Date));
-                    sb.Append(",\"vendor\":").Append(JsonStr(e.Vendor));
-                    sb.Append(",\"class\":").Append(JsonStr(e.Class));
-                    sb.Append(",\"updateAvailable\":").Append(e.UpdateAvailable ? "true" : "false");
-                    sb.Append(",\"updateSource\":").Append(JsonStr(e.UpdateSource == null ? "" : e.UpdateSource));
-                    sb.Append(",\"updateVersion\":").Append(JsonStr(e.UpdateVersion == null ? "" : e.UpdateVersion));
-                    sb.Append(",\"canInstall\":").Append(e.CanInstall ? "true" : "false");
-                    sb.Append('}');
-                }
-                sb.Append("]}");
-            }
-            return sb.ToString();
         }
 
         // ---- small helpers --------------------------------------------------
@@ -623,8 +591,8 @@ namespace DriverWatch
 
         static int CompareVersions(string a, string b)
         {
-            string[] pa = (a ?? "").Split('.');
-            string[] pb = (b ?? "").Split('.');
+            string[] pa = (a == null ? "" : a).Split('.');
+            string[] pb = (b == null ? "" : b).Split('.');
             int n = Math.Max(pa.Length, pb.Length);
             for (int i = 0; i < n; i++)
             {
@@ -645,95 +613,366 @@ namespace DriverWatch
                 return h.ToString("x8");
             }
         }
+    }
 
-        static string JsonStr(string s)
+    // ---- The panel (Beacon Prime look, drawn natively) ----------------------
+    //
+    // A frameless, opaque, always-on-top window pinned to the upper-right, drawn
+    // with GDI+: gold-dotted title, one two-line row per driver, a gold
+    // "Update available" pill on the ones that are behind. No web view.
+    class PanelForm : Form
+    {
+        static readonly Color CBg      = Color.FromArgb(0x20, 0x22, 0x26);
+        static readonly Color CText    = Color.FromArgb(0xe8, 0xe8, 0xea);
+        static readonly Color CMuted   = Color.FromArgb(0x9a, 0x9b, 0xa0);
+        static readonly Color CGreen   = Color.FromArgb(0x43, 0xb5, 0x81);
+        static readonly Color CGold    = Color.FromArgb(0xf4, 0xc9, 0x5d);
+        static readonly Color CGoldHi  = Color.FromArgb(0xff, 0xd8, 0x6f);
+        static readonly Color CDivider = Color.FromArgb(22, 255, 255, 255);
+        static readonly Color CHover   = Color.FromArgb(10, 255, 255, 255);
+        static readonly Color CBorder  = Color.FromArgb(46, 255, 255, 255);
+        static readonly Color CErr     = Color.FromArgb(0xff, 0x6b, 0x6b);
+
+        const int W = 424;
+        const int Pad = 16;
+        const int HeaderH = 54;
+        const int RowH = 58;
+        const int FooterH = 46;
+
+        readonly Font _fTitle, _fName, _fSub, _fPill, _fMeta, _fLink;
+
+        class PillHit { public Rectangle Rect; public string Id; public string Name; }
+        readonly List<PillHit> _pills = new List<PillHit>();
+        Rectangle _checkRect = Rectangle.Empty;
+        int _hoverRow = -1;
+
+        List<DriverEntry> _rows = new List<DriverEntry>();
+        bool _checking;
+        DateTime _lastCheck = DateTime.MinValue;
+        string _error = "";
+        string _status = "";
+        DateTime _lastHidden = DateTime.MinValue;
+        public DateTime LastHidden { get { return _lastHidden; } }
+
+        public PanelForm()
         {
-            if (s == null) return "\"\"";
-            StringBuilder sb = new StringBuilder("\"");
-            foreach (char c in s)
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            TopMost = true;
+            StartPosition = FormStartPosition.Manual;
+            Text = "DriverWatch";
+            Width = W;
+            Height = HeaderH + RowH + FooterH;
+            BackColor = CBg;
+            DoubleBuffered = true;
+            ResizeRedraw = true;
+            KeyPreview = true;
+
+            _fTitle = new Font("Segoe UI", 12.5f, FontStyle.Bold);
+            _fName  = new Font("Segoe UI", 10f, FontStyle.Bold);
+            _fSub   = new Font("Segoe UI", 8.25f, FontStyle.Regular);
+            _fPill  = new Font("Segoe UI", 8.25f, FontStyle.Bold);
+            _fMeta  = new Font("Segoe UI", 8.25f, FontStyle.Regular);
+            _fLink  = new Font("Segoe UI", 8.75f, FontStyle.Bold);
+        }
+
+        // Escape (when focused) hides the panel, like dismissing a popover.
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            if (keyData == Keys.Escape) { HidePanel(); return true; }
+            return base.ProcessCmdKey(ref msg, keyData);
+        }
+
+        // Click-away dismiss.
+        protected override void OnDeactivate(EventArgs e)
+        {
+            base.OnDeactivate(e);
+            HidePanel();
+        }
+
+        public void ShowPanel()
+        {
+            SetData(Program.Gather());
+            Show();
+            TopMost = true;
+            BringToFront();
+            Activate();
+        }
+
+        public void HidePanel()
+        {
+            _lastHidden = DateTime.UtcNow;
+            Hide();
+        }
+
+        // Paint the panel at its computed size to a PNG (for headless preview).
+        public void RenderTo(string path)
+        {
+            SetData(Program.Gather());
+            using (Bitmap bmp = new Bitmap(Width, Height))
             {
-                if (c == '"') sb.Append("\\\"");
-                else if (c == '\\') sb.Append("\\\\");
-                else if (c == '\n') sb.Append("\\n");
-                else if (c == '\r') sb.Append("\\r");
-                else if (c == '\t') sb.Append("\\t");
-                else if (c < 0x20) sb.Append("\\u").Append(((int)c).ToString("x4"));
-                else sb.Append(c);
+                DrawToBitmap(bmp, new Rectangle(0, 0, Width, Height));
+                bmp.Save(path, System.Drawing.Imaging.ImageFormat.Png);
             }
-            sb.Append('"');
-            return sb.ToString();
         }
 
-        static string JsonField(string body, string field)
+        // Called from any thread when the check state changes.
+        public void PushSnapshot()
         {
-            Match m = Regex.Match(body ?? "", "\"" + Regex.Escape(field) + "\"\\s*:\\s*\"([^\"]*)\"");
-            return m.Success ? m.Groups[1].Value : "";
+            if (!IsHandleCreated) return;
+            try { BeginInvoke((MethodInvoker)delegate { SetData(Program.Gather()); }); }
+            catch { }
         }
 
-        // ---- the page (Beacon look) ----------------------------------------
-
-        static string Html = string.Empty;
-        static Program()
+        void SetData(Snapshot s)
         {
-            Html = BuildHtml();
+            _rows = s.Rows != null ? s.Rows : new List<DriverEntry>();
+            _checking = s.Checking;
+            _lastCheck = s.LastCheck;
+            _error = s.Error == null ? "" : s.Error;
+
+            int updates = 0;
+            foreach (DriverEntry e in _rows) if (e.UpdateAvailable) updates++;
+            if (_checking && _rows.Count == 0) _status = "Scanning drivers…";
+            else if (_checking) _status = "Checking…";
+            else if (_rows.Count == 0) _status = "No matching drivers found.";
+            else if (updates == 0) _status = _rows.Count + " drivers · all current";
+            else _status = updates + " update" + (updates == 1 ? "" : "s") + " available";
+
+            int rowsShown = _rows.Count == 0 ? 1 : _rows.Count;   // a placeholder line when empty
+            int h = HeaderH + rowsShown * RowH + FooterH;
+            Rectangle wa = Screen.PrimaryScreen.WorkingArea;
+            if (h > wa.Height - 24) h = wa.Height - 24;
+            Height = h;
+            Location = new Point(wa.Right - Width - 12, wa.Top + 12);
+            UpdateRegion();
+            Invalidate();
         }
 
-        static string BuildHtml()
+        void UpdateRegion()
         {
-            StringBuilder s = new StringBuilder();
-            s.Append("<!doctype html><html><head><meta charset='utf-8'>");
-            s.Append("<meta name='viewport' content='width=device-width, initial-scale=1'>");
-            s.Append("<title>DriverWatch</title><style>");
-            s.Append(":root{color-scheme:dark;}");
-            s.Append("body{margin:0;background:#15171c;color:#e8e6e1;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;}");
-            s.Append("header{padding:18px 20px;font-size:20px;font-weight:600;border-bottom:1px solid #2a2d34;display:flex;align-items:center;gap:10px;}");
-            s.Append("header .dot{width:9px;height:9px;border-radius:50%;background:#f4c95d;}");
-            s.Append("header .sub{margin-left:auto;font-size:12px;color:#9a9a9a;font-weight:400;display:flex;align-items:center;gap:12px;}");
-            s.Append("header button{background:#23262d;border:1px solid #34373f;color:#e8e6e1;border-radius:6px;padding:5px 11px;font-size:12px;cursor:pointer;}");
-            s.Append(".wrap{max-width:820px;margin:0 auto;padding:8px 12px 40px;}");
-            s.Append(".hd,.row{display:grid;grid-template-columns:1fr 150px 110px 130px;gap:12px;align-items:center;padding:11px 12px;}");
-            s.Append(".hd{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#7d818b;border-bottom:1px solid #2a2d34;position:sticky;top:0;background:#15171c;}");
-            s.Append(".row{border-bottom:1px solid #23262d;}");
-            s.Append(".row:hover{background:#191c22;}");
-            s.Append(".name{font-size:14px;font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}");
-            s.Append(".klass{font-size:11px;color:#7d818b;text-transform:uppercase;letter-spacing:.03em;}");
-            s.Append(".ver{font-size:12.5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#c8c6c0;}");
-            s.Append(".date{font-size:12.5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#9a9a9a;}");
-            s.Append(".pill{font-size:11.5px;font-weight:600;border:none;border-radius:999px;padding:5px 12px;cursor:pointer;}");
-            s.Append(".pill.upd{background:#f4c95d;color:#15171c;}");
-            s.Append(".pill.upd:hover{background:#ffd86f;}");
-            s.Append(".pill.vendor{background:transparent;color:#f4c95d;border:1px solid #6a5a2a;}");
-            s.Append(".cur{font-size:11.5px;color:#4c8c5a;}");
-            s.Append(".busy{font-size:11.5px;color:#7d818b;}");
-            s.Append(".err{color:#ff6b6b;font-size:12px;padding:10px 12px;}");
-            s.Append("</style></head><body>");
-            s.Append("<header><span class='dot'></span> DriverWatch");
-            s.Append("<span class='sub'><span id='meta'></span><button onclick='check()'>Check now</button></span></header>");
-            s.Append("<div class='wrap'><div class='hd'><div>Driver</div><div>Version</div><div>Released</div><div style='text-align:right'>Status</div></div>");
-            s.Append("<div id='list'></div><div id='err' class='err'></div></div>");
-            s.Append("<script>");
-            s.Append("function esc(s){return String(s==null?'':s).replace(/[&<>\"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c];});}");
-            s.Append("async function load(){var r=await fetch('/api/drivers');var d=await r.json();");
-            s.Append("var meta=document.getElementById('meta');meta.textContent=(d.checking?'Checking\\u2026 ':'')+(d.lastCheck?('Checked '+d.lastCheck):'Not checked yet');");
-            s.Append("document.getElementById('err').textContent=d.error||'';");
-            s.Append("var list=document.getElementById('list');var h='';");
-            s.Append("for(var i=0;i<d.drivers.length;i++){var e=d.drivers[i];");
-            s.Append("var status;");
-            s.Append("if(e.updateAvailable){var label='Update available';");
-            s.Append("var tip=e.updateVersion?(e.updateSource+' \\u2192 '+e.updateVersion):e.updateSource;");
-            s.Append("if(e.canInstall){status='<button class=\"pill upd\" onclick=\"upd(\\''+e.id+'\\')\" title=\"'+esc(tip)+'\">'+label+'</button>';}");
-            s.Append("else{status='<button class=\"pill vendor\" onclick=\"upd(\\''+e.id+'\\')\" title=\"Opens '+esc(tip)+'\">'+label+'</button>';}}");
-            s.Append("else{status='<span class=\"cur\">Up to date</span>';}");
-            s.Append("h+='<div class=\"row\"><div><div class=\"name\" title=\"'+esc(e.name)+'\">'+esc(e.name)+'</div><div class=\"klass\">'+esc(e.class)+(e.vendor?(' \\u00b7 '+esc(e.vendor)):'')+'</div></div>';");
-            s.Append("h+='<div class=\"ver\">'+esc(e.version||'\\u2014')+'</div>';");
-            s.Append("h+='<div class=\"date\">'+esc(e.date||'\\u2014')+'</div>';");
-            s.Append("h+='<div style=\"text-align:right\">'+status+'</div></div>';}");
-            s.Append("list.innerHTML=h;}");
-            s.Append("async function upd(id){var r=await fetch('/api/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})});var j=await r.json();if(j.message)alert(j.message);load();}");
-            s.Append("async function check(){await fetch('/api/check',{method:'POST'});setTimeout(load,600);}");
-            s.Append("load();setInterval(load,4000);");
-            s.Append("</script></body></html>");
-            return s.ToString();
+            using (GraphicsPath p = Rounded(new Rectangle(0, 0, Width, Height), 12))
+                Region = new Region(p);
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            UpdateRegion();
+        }
+
+        static GraphicsPath Rounded(Rectangle r, int radius)
+        {
+            int d = radius * 2;
+            GraphicsPath p = new GraphicsPath();
+            if (d > r.Width) d = r.Width;
+            if (d > r.Height) d = r.Height;
+            p.AddArc(r.X, r.Y, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            _pills.Clear();
+
+            Rectangle full = new Rectangle(0, 0, Width, Height);
+            using (SolidBrush bg = new SolidBrush(CBg))
+            using (GraphicsPath p = Rounded(new Rectangle(0, 0, Width - 1, Height - 1), 12))
+            {
+                g.FillPath(bg, p);
+                using (Pen bp = new Pen(CBorder)) g.DrawPath(bp, p);
+            }
+
+            // Header: gold dot + title, right-aligned check time.
+            using (SolidBrush gold = new SolidBrush(CGold))
+                g.FillEllipse(gold, Pad, 22, 9, 9);
+            Draw(g, "DriverWatch", _fTitle, new Rectangle(Pad + 17, 15, 220, 26), CText, false);
+
+            string when = _checking
+                ? "Checking…"
+                : (_lastCheck == DateTime.MinValue ? "Not checked" : "Checked " + _lastCheck.ToLocalTime().ToString("HH:mm"));
+            DrawRight(g, when, _fMeta, Width - Pad, 21, W - 240, CMuted);
+
+            using (Pen dv = new Pen(CDivider)) g.DrawLine(dv, Pad, HeaderH, Width - Pad, HeaderH);
+
+            int y = HeaderH;
+
+            if (_rows.Count == 0)
+            {
+                string msg = _checking ? "Scanning drivers…" : "No matching drivers found.";
+                Draw(g, msg, _fSub, new Rectangle(Pad + 17, y + (RowH / 2) - 9, Width - 2 * Pad, 18), CMuted, false);
+                y += RowH;
+            }
+            else
+            {
+                for (int i = 0; i < _rows.Count; i++)
+                {
+                    DriverEntry d = _rows[i];
+                    if (i == _hoverRow)
+                        using (SolidBrush hb = new SolidBrush(CHover))
+                            g.FillRectangle(hb, 1, y, Width - 2, RowH);
+
+                    // status dot
+                    Color dotc = d.UpdateAvailable ? CGold : CGreen;
+                    using (SolidBrush db = new SolidBrush(dotc)) g.FillEllipse(db, Pad, y + 15, 9, 9);
+
+                    // line 1: name (left) + status (right: pill, or "Up to date")
+                    int line1 = y + 9;
+                    int statusLeft;
+                    if (d.UpdateAvailable)
+                    {
+                        string ptxt = "Update available";
+                        Size ts = TextRenderer.MeasureText(ptxt, _fPill);
+                        int pw = ts.Width + 22, ph = 23;
+                        Rectangle pill = new Rectangle(Width - Pad - pw, line1, pw, ph);
+                        bool hot = pill.Contains(PointToClient(Cursor.Position));
+                        using (SolidBrush pb = new SolidBrush(hot ? CGoldHi : CGold))
+                        using (GraphicsPath pp = Rounded(pill, ph / 2))
+                            g.FillPath(pb, pp);
+                        Draw(g, ptxt, _fPill, pill, CBg, true);
+                        PillHit ph2 = new PillHit(); ph2.Rect = pill; ph2.Id = d.Id; ph2.Name = d.Name;
+                        _pills.Add(ph2);
+                        statusLeft = pill.Left;
+                    }
+                    else
+                    {
+                        Size us = TextRenderer.MeasureText("Up to date", _fSub);
+                        statusLeft = Width - Pad - us.Width;
+                        DrawRight(g, "Up to date", _fSub, Width - Pad, line1 + 2, us.Width + 6, CGreen);
+                    }
+
+                    int nameRight = statusLeft - 12;
+                    Draw(g, d.Name, _fName, new Rectangle(Pad + 17, line1, Math.Max(40, nameRight - (Pad + 17)), 20), CText, false);
+
+                    // line 2: version (→ new) / date on the right, "Kind · Vendor" on the left
+                    int line2 = y + 31;
+                    string meta = d.Version;
+                    Color metaCol = CMuted;
+                    if (d.UpdateAvailable && d.UpdateVersion != null && d.UpdateVersion.Length > 0)
+                    {
+                        meta = d.Version + "  →  " + d.UpdateVersion;
+                        metaCol = CGold;
+                    }
+                    else if (d.Date != null && d.Date.Length > 0)
+                    {
+                        meta = d.Version + "    " + d.Date;
+                    }
+                    Size mm = TextRenderer.MeasureText(meta, _fMeta);
+                    int metaW = Math.Min(mm.Width + 6, 232);
+                    int metaLeft = Width - Pad - metaW;
+                    DrawRight(g, meta, _fMeta, Width - Pad, line2, metaW, metaCol);
+
+                    string sub = NiceClass(d.Class) + "  ·  " + ShortVendor(d.Vendor);
+                    Draw(g, sub, _fSub, new Rectangle(Pad + 17, line2, Math.Max(40, metaLeft - 12 - (Pad + 17)), 18), CMuted, false);
+
+                    using (Pen dv = new Pen(CDivider)) g.DrawLine(dv, Pad, y + RowH, Width - Pad, y + RowH);
+                    y += RowH;
+                }
+            }
+
+            // Footer: status (left) + Check now (right)
+            int fy = Height - FooterH;
+            using (Pen dv = new Pen(CDivider)) g.DrawLine(dv, Pad, fy, Width - Pad, fy);
+            Color statusColor = _error.Length > 0 ? CErr : CMuted;
+            string footerLeft = _error.Length > 0 ? _error : _status;
+            Draw(g, footerLeft, _fMeta, new Rectangle(Pad, fy + (FooterH / 2) - 9, Width - 2 * Pad - 90, 18), statusColor, false);
+
+            Size cs = TextRenderer.MeasureText("Check now", _fLink);
+            _checkRect = new Rectangle(Width - Pad - cs.Width - 10, fy + (FooterH / 2) - (cs.Height / 2) - 3, cs.Width + 10, cs.Height + 6);
+            bool chot = _checkRect.Contains(PointToClient(Cursor.Position));
+            Draw(g, "Check now", _fLink, _checkRect, chot ? CGoldHi : CGold, true);
+        }
+
+        static void Draw(Graphics g, string text, Font f, Rectangle r, Color c, bool center)
+        {
+            TextFormatFlags fl = TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis | TextFormatFlags.VerticalCenter;
+            if (center) fl |= TextFormatFlags.HorizontalCenter;
+            else fl |= TextFormatFlags.Left;
+            TextRenderer.DrawText(g, text == null ? "" : text, f, r, c, fl);
+        }
+
+        static void DrawRight(Graphics g, string text, Font f, int right, int top, int maxw, Color c)
+        {
+            Rectangle r = new Rectangle(right - maxw, top, maxw, 18);
+            TextRenderer.DrawText(g, text == null ? "" : text, f, r, c,
+                TextFormatFlags.NoPrefix | TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+        }
+
+        static string NiceClass(string cls)
+        {
+            if (Program0Eq(cls, "DISPLAY")) return "Graphics";
+            if (Program0Eq(cls, "MEDIA")) return "Audio";
+            if (Program0Eq(cls, "NET")) return "Network";
+            if (Program0Eq(cls, "BLUETOOTH")) return "Bluetooth";
+            if (Program0Eq(cls, "SYSTEM")) return "System";
+            if (cls == null || cls.Length == 0) return "Device";
+            return char.ToUpperInvariant(cls[0]) + cls.Substring(1).ToLowerInvariant();
+        }
+
+        static string ShortVendor(string v)
+        {
+            if (v == null) return "";
+            if (v.IndexOf("Advanced Micro", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                string.Equals(v, "AMD", StringComparison.OrdinalIgnoreCase)) return "AMD";
+            if (v.IndexOf("Realtek", StringComparison.OrdinalIgnoreCase) >= 0) return "Realtek";
+            if (v.IndexOf("Microsoft", StringComparison.OrdinalIgnoreCase) >= 0) return "Microsoft";
+            return v;
+        }
+
+        static bool Program0Eq(string a, string b) { return string.Equals(a, b, StringComparison.OrdinalIgnoreCase); }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            int row = -1;
+            if (_rows.Count > 0 && e.Y >= HeaderH && e.Y < Height - FooterH)
+                row = (e.Y - HeaderH) / RowH;
+            if (row >= _rows.Count) row = -1;
+            if (row != _hoverRow) { _hoverRow = row; Invalidate(); }
+
+            bool overClickable = _checkRect.Contains(e.Location);
+            if (!overClickable) foreach (PillHit ph in _pills) if (ph.Rect.Contains(e.Location)) { overClickable = true; break; }
+            Cursor = overClickable ? Cursors.Hand : Cursors.Default;
+            // Repaint hot states (pill / link hover) cheaply.
+            Invalidate();
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            if (_hoverRow != -1) { _hoverRow = -1; Invalidate(); }
+        }
+
+        protected override void OnMouseClick(MouseEventArgs e)
+        {
+            base.OnMouseClick(e);
+            if (e.Button != MouseButtons.Left) return;
+
+            if (_checkRect.Contains(e.Location)) { Program.RequestCheck(); return; }
+
+            foreach (PillHit ph in _pills)
+            {
+                if (ph.Rect.Contains(e.Location)) { OnPill(ph.Id, ph.Name); return; }
+            }
+        }
+
+        void OnPill(string id, string name)
+        {
+            _status = "Updating " + name + "…";
+            _error = "";
+            Invalidate();
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string msg = Program.Install(id);
+                try { BeginInvoke((MethodInvoker)delegate { _status = msg; Invalidate(); }); }
+                catch { }
+            });
         }
     }
 }
