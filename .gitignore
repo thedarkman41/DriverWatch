@@ -1,0 +1,13 @@
+# Build output — DriverWatch is compiled on the Windows host, never checked in.
+*.exe
+*.pdb
+bin/
+obj/
+
+# Runtime logs
+driverwatch.log
+*.log
+
+# OS cruft
+.DS_Store
+Thumbs.db
