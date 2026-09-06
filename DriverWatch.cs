@@ -22,6 +22,7 @@ using System.Globalization;
 using System.IO;
 using System.Management;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -46,6 +47,7 @@ namespace DriverWatch
         public string UpdateVersion;  // the newer version, when known
         public string UpdateRef;      // a Windows Update UpdateID, or a vendor URL
         public bool CanInstall;       // true = install here; false = opens vendor page
+        public bool Unchecked;        // vendor currency could not be determined (e.g. AMD unreachable)
     }
 
     // An immutable read of state, handed to the panel to paint.
@@ -78,6 +80,11 @@ namespace DriverWatch
         [STAThread]
         static void Main(string[] args)
         {
+            // Set the TLS floor once, for every entry path (GUI, --check, --render).
+            // TLS 1.2 only: never re-enable the deprecated 1.0/1.1, and don't name
+            // Tls13 (its enum value isn't present before .NET Framework 4.8).
+            try { ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12; } catch { }
+
             try { Directory.CreateDirectory(DataDir()); }
             catch { }
 
@@ -166,26 +173,36 @@ namespace DriverWatch
             else _panel.ShowPanel();
         }
 
+        // Icon.FromHandle wraps a native HICON without owning it, so the handle
+        // leaks unless we free it ourselves. We clone into a fully-owned managed
+        // Icon and destroy the temporary handle immediately; callers Dispose the
+        // returned Icon (RefreshTrayIcon frees the previous one before replacing).
+        [DllImport("user32.dll", SetLastError = true)]
+        static extern bool DestroyIcon(IntPtr handle);
+
         // A drawn icon so there is no .ico to ship: a gold dot for the Beacon
         // family, amber-ringed when something needs updating so the tray tells
         // you at a glance.
         static Icon MakeIcon(bool attention)
         {
-            Bitmap bmp = new Bitmap(32, 32);
-            using (Graphics g = Graphics.FromImage(bmp))
+            using (Bitmap bmp = new Bitmap(32, 32))
             {
-                g.SmoothingMode = SmoothingMode.AntiAlias;
-                g.Clear(Color.Transparent);
-                if (attention)
+                using (Graphics g = Graphics.FromImage(bmp))
                 {
-                    using (Pen ring = new Pen(Color.FromArgb(0xF2, 0x8B, 0x30), 3f))
-                        g.DrawEllipse(ring, 3, 3, 26, 26);
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.Clear(Color.Transparent);
+                    if (attention)
+                    {
+                        using (Pen ring = new Pen(Color.FromArgb(0xF2, 0x8B, 0x30), 3f))
+                            g.DrawEllipse(ring, 3, 3, 26, 26);
+                    }
+                    using (SolidBrush b = new SolidBrush(Color.FromArgb(0xF4, 0xC9, 0x5D)))
+                        g.FillEllipse(b, 8, 8, 16, 16);
                 }
-                using (SolidBrush b = new SolidBrush(Color.FromArgb(0xF4, 0xC9, 0x5D)))
-                    g.FillEllipse(b, 8, 8, 16, 16);
+                IntPtr h = bmp.GetHicon();
+                try { using (Icon tmp = Icon.FromHandle(h)) return (Icon)tmp.Clone(); }
+                finally { DestroyIcon(h); }
             }
-            IntPtr h = bmp.GetHicon();
-            return Icon.FromHandle(h);
         }
 
         static void RefreshTrayIcon()
@@ -196,7 +213,15 @@ namespace DriverWatch
                 attention = false;
                 foreach (DriverEntry e in _entries) if (e.UpdateAvailable) { attention = true; break; }
             }
-            try { if (_tray != null) _tray.Icon = MakeIcon(attention); }
+            try
+            {
+                if (_tray != null)
+                {
+                    Icon old = _tray.Icon;
+                    _tray.Icon = MakeIcon(attention);
+                    if (old != null) old.Dispose();
+                }
+            }
             catch { }
         }
 
@@ -419,11 +444,17 @@ namespace DriverWatch
                         d.UpdateRef = r.Url;
                         d.CanInstall = false;   // vendor package: open the page, don't run a .exe blind
                     }
+                    else if (r == null || !r.Reached)
+                    {
+                        // We could not reach/parse AMD (their site now bot-walls
+                        // plain HTTP). Say so honestly rather than imply "current".
+                        d.Unchecked = true;
+                    }
                 }
             }
         }
 
-        class VendorResult { public bool Available; public string Version; public string Url; public string Source = "Vendor"; }
+        class VendorResult { public bool Available; public bool Reached; public string Version; public string Url; public string Source = "Vendor"; }
 
         // AMD integrated Vega (Ryzen mobile) rides the Polaris & Vega driver
         // branch. Its release-notes page names the current "Windows Driver Store
@@ -447,11 +478,13 @@ namespace DriverWatch
             try
             {
                 string notesUrl = ProbeLatestAmdNotes();
-                if (notesUrl == null) return r;
+                if (notesUrl == null) { Log("AMD: no reachable release-notes page (site may be bot-walling)"); return r; }
                 string notes = Fetch(notesUrl);
                 Match store = Regex.Match(notes == null ? "" : notes, @"Windows Driver Store Version\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)",
                     RegexOptions.IgnoreCase);
-                if (!store.Success) return r;
+                if (!store.Success) { Log("AMD: fetched notes but no store-version match"); return r; }
+                // Got a definitive answer from AMD.
+                r.Reached = true;
                 string latest = store.Groups[1].Value;
                 if (CompareVersions(latest, installed) > 0)
                 {
@@ -490,7 +523,6 @@ namespace DriverWatch
         {
             try
             {
-                try { ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | SecurityProtocolType.Tls11 | SecurityProtocolType.Tls; } catch { }
                 HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
                 req.Method = "HEAD";
                 req.UserAgent = "Mozilla/5.0 (DriverWatch)";
@@ -506,14 +538,24 @@ namespace DriverWatch
         {
             try
             {
-                try { ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | SecurityProtocolType.Tls11 | SecurityProtocolType.Tls; } catch { }
                 HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
                 req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) DriverWatch/1.0";
                 req.Timeout = 15000;
                 req.AllowAutoRedirect = true;
                 using (WebResponse resp = req.GetResponse())
                 using (StreamReader sr = new StreamReader(resp.GetResponseStream()))
-                    return sr.ReadToEnd();
+                {
+                    // Read with a hard cap. The notes page is small; refusing to
+                    // buffer an unbounded body keeps a hostile/broken response from
+                    // exhausting memory. 512 KB is far above any real notes page.
+                    const int cap = 512 * 1024;
+                    char[] buf = new char[16384];
+                    StringBuilder sb = new StringBuilder();
+                    int read;
+                    while (sb.Length < cap && (read = sr.Read(buf, 0, buf.Length)) > 0)
+                        sb.Append(buf, 0, read);
+                    return sb.ToString();
+                }
             }
             catch (Exception e) { Log("fetch " + url + ": " + e.Message); return null; }
         }
@@ -731,13 +773,14 @@ namespace DriverWatch
             _lastCheck = s.LastCheck;
             _error = s.Error == null ? "" : s.Error;
 
-            int updates = 0;
-            foreach (DriverEntry e in _rows) if (e.UpdateAvailable) updates++;
+            int updates = 0, unchecked_ = 0;
+            foreach (DriverEntry e in _rows) { if (e.UpdateAvailable) updates++; else if (e.Unchecked) unchecked_++; }
             if (_checking && _rows.Count == 0) _status = "Scanning drivers…";
             else if (_checking) _status = "Checking…";
             else if (_rows.Count == 0) _status = "No matching drivers found.";
-            else if (updates == 0) _status = _rows.Count + " drivers · all current";
-            else _status = updates + " update" + (updates == 1 ? "" : "s") + " available";
+            else if (updates > 0) _status = updates + " update" + (updates == 1 ? "" : "s") + " available";
+            else if (unchecked_ > 0) _status = _rows.Count + " drivers · " + unchecked_ + " unverified";
+            else _status = _rows.Count + " drivers · all current";
 
             int rowsShown = _rows.Count == 0 ? 1 : _rows.Count;   // a placeholder line when empty
             int h = HeaderH + rowsShown * RowH + FooterH;
@@ -818,8 +861,8 @@ namespace DriverWatch
                         using (SolidBrush hb = new SolidBrush(CHover))
                             g.FillRectangle(hb, 1, y, Width - 2, RowH);
 
-                    // status dot
-                    Color dotc = d.UpdateAvailable ? CGold : CGreen;
+                    // status dot: gold = update, grey = couldn't verify, green = current
+                    Color dotc = d.UpdateAvailable ? CGold : (d.Unchecked ? CMuted : CGreen);
                     using (SolidBrush db = new SolidBrush(dotc)) g.FillEllipse(db, Pad, y + 15, 9, 9);
 
                     // line 1: name (left) + status (right: pill, or "Up to date")
@@ -842,9 +885,11 @@ namespace DriverWatch
                     }
                     else
                     {
-                        Size us = TextRenderer.MeasureText("Up to date", _fSub);
+                        string st = d.Unchecked ? "Check unavailable" : "Up to date";
+                        Color sc = d.Unchecked ? CMuted : CGreen;
+                        Size us = TextRenderer.MeasureText(st, _fSub);
                         statusLeft = Width - Pad - us.Width;
-                        DrawRight(g, "Up to date", _fSub, Width - Pad, line1 + 2, us.Width + 6, CGreen);
+                        DrawRight(g, st, _fSub, Width - Pad, line1 + 2, us.Width + 6, sc);
                     }
 
                     int nameRight = statusLeft - 12;

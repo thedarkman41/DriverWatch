@@ -19,7 +19,7 @@ Microsoft inbox drivers, the monitor, and the rest of the enumerator noise are l
 - **Enumeration:** WMI `Win32_PnPSignedDriver`, filtered to the drivers above and deduped (newest version wins). Each row shows the installed **version** and **release date**.
 - **Currency check (weekly):** for each driver, DriverWatch decides whether a newer one exists.
   - **Windows Update** (the Windows Update Agent COM API) covers the Realtek drivers and the AMD audio device. These are installable in place.
-  - **AMD** directly for the Radeon GPU: it reads the "Windows Driver Store Version" from the dated Polaris/Vega release-notes page, found by probing that URL newest-first (the release-notes index is a JavaScript single-page app, so its links are not in the static HTML). A vendor package opens AMD's page rather than running an unattended `.exe`.
+  - **AMD** directly for the Radeon GPU: it reads the "Windows Driver Store Version" from the dated Polaris/Vega release-notes page, found by probing that URL newest-first (the release-notes index is a JavaScript single-page app, so its links are not in the static HTML). A vendor package opens AMD's page rather than running an unattended `.exe`. If AMD's site blocks the request (it fronts the pages with bot protection), the GPU row shows **Check unavailable** rather than falsely claiming the driver is current.
 - **Update:** drivers that are behind get a gold **Update available** pill. Click it to install (Windows Update) or open the vendor page (AMD).
 - **Cadence:** a six-hourly timer runs a full check whenever seven days have elapsed, so a suspend or reboot cannot silently swallow the weekly pass. The tray icon gains an amber ring when anything needs updating.
 
